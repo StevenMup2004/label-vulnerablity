@@ -1,0 +1,4463 @@
+import gzip
+import json
+import re
+import zipfile
+
+from collections import Counter, defaultdict
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+
+import pandas as pd
+import requests
+
+
+# ============================================================
+# OPTIONAL FAST JSON
+# ============================================================
+
+try:
+    import orjson
+
+    FAST_JSON = True
+
+    def json_load_bytes(data):
+        return orjson.loads(data)
+
+except ImportError:
+    FAST_JSON = False
+
+    def json_load_bytes(data):
+        return json.loads(
+            data.decode("utf-8")
+        )
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+INPUT_PARQUET = (
+    "TitanVul_language_FINAL.parquet"
+)
+
+FINAL_PARQUET = (
+    "TitanVul_recovery_ALL_FINAL.parquet"
+)
+
+FINAL_CSV = (
+    "TitanVul_recovery_ALL_FINAL.csv"
+)
+
+FINAL_AUDIT = (
+    "TitanVul_recovery_ALL_audit.csv"
+)
+
+
+# ============================================================
+# SAME COMMIT MODE
+#
+# majority:
+#   reproduce kết quả hiện tại của bạn.
+#
+# unambiguous:
+#   chỉ propagate nếu commit map đúng 1 label.
+#
+# ============================================================
+
+COMMIT_MODE = "majority"
+
+
+# ============================================================
+# SAVE INTERMEDIATE FILES
+# ============================================================
+
+SAVE_INTERMEDIATE = True
+
+
+# ============================================================
+# NETWORK
+# ============================================================
+
+REQUEST_TIMEOUT = 180
+
+DOWNLOAD_CHUNK_SIZE = (
+    1024 * 1024
+)
+
+
+# ============================================================
+# OSV
+# ============================================================
+
+OSV_DATABASE_URL = (
+    "https://storage.googleapis.com/"
+    "osv-vulnerabilities/all.zip"
+)
+
+OSV_ZIP = Path(
+    "osv_all.zip"
+)
+
+OSV_FIXED_CACHE = Path(
+    "osv_fixed_commit_matches.json"
+)
+
+
+# ============================================================
+# NVD
+# ============================================================
+
+NVD_FEED_BASE = (
+    "https://nvd.nist.gov/"
+    "feeds/json/cve/2.0"
+)
+
+NVD_DIR = Path(
+    "nvd_feeds"
+)
+
+NVD_START_YEAR = 2002
+
+NVD_END_YEAR = (
+    datetime.now().year
+)
+
+NVD_SCAN_CACHE = Path(
+    "nvd_scan_cache.json.gz"
+)
+
+
+# ============================================================
+# CVE.ORG / cvelistV5
+# ============================================================
+
+CVELIST_URL = (
+    "https://github.com/"
+    "CVEProject/cvelistV5/"
+    "archive/refs/heads/main.zip"
+)
+
+CVELIST_ZIP = Path(
+    "cvelistV5_latest.zip"
+)
+
+CVEORG_SCAN_CACHE = Path(
+    "cveorg_scan_cache.json.gz"
+)
+
+
+# ============================================================
+# REGEX
+# ============================================================
+
+SHA40_RE = re.compile(
+    r"(?<![0-9a-fA-F])"
+    r"([0-9a-fA-F]{40})"
+    r"(?![0-9a-fA-F])"
+)
+
+
+COMMIT_SHA_RE = re.compile(
+    r"(?:"
+    r"/commit/"
+    r"|/commits/"
+    r"|/-/commit/"
+    r")"
+    r"([0-9a-fA-F]{40})"
+    r"(?:[/?#]|$)",
+    re.IGNORECASE,
+)
+
+
+CVE_FULL_RE = re.compile(
+    r"^CVE-\d{4}-\d{4,}$",
+    re.IGNORECASE,
+)
+
+
+CVE_MESSAGE_RE = re.compile(
+    r"\bCVE[-_ ]?"
+    r"(\d{4})"
+    r"[-_ ]?"
+    r"(\d{4,})"
+    r"\b",
+    re.IGNORECASE,
+)
+
+
+CWE_MESSAGE_RE = re.compile(
+    r"\bCWE[-_ ]?"
+    r"(\d{1,5})"
+    r"\b",
+    re.IGNORECASE,
+)
+
+
+CWE_FULL_RE = re.compile(
+    r"^CWE-\d+$",
+    re.IGNORECASE,
+)
+
+
+# ============================================================
+# BASIC HELPERS
+# ============================================================
+
+def is_missing(value):
+
+    if value is None:
+        return True
+
+    if isinstance(value, str):
+
+        value = value.strip()
+
+        return value.lower() in {
+            "",
+            "nan",
+            "none",
+            "null",
+            "unknown",
+        }
+
+    try:
+
+        result = pd.isna(value)
+
+        if isinstance(result, bool):
+            return result
+
+    except Exception:
+        pass
+
+    return False
+
+
+def normalize_missing(df):
+
+    for col in [
+        "cve_id",
+        "cwe_id",
+    ]:
+
+        if col not in df.columns:
+            df[col] = None
+
+        mask = (
+            df[col]
+            .apply(is_missing)
+        )
+
+        df.loc[
+            mask,
+            col
+        ] = None
+
+    return df
+
+
+def initialize_sources(df):
+
+    df["cve_source"] = None
+    df["cwe_source"] = None
+
+    df.loc[
+        df["cve_id"].notna(),
+        "cve_source"
+    ] = "original"
+
+    df.loc[
+        df["cwe_id"].notna(),
+        "cwe_source"
+    ] = "original"
+
+    return df
+
+
+# ============================================================
+# STATISTICS
+# ============================================================
+
+def label_stats(df):
+
+    has_cve = (
+        df["cve_id"].notna()
+    )
+
+    has_cwe = (
+        df["cwe_id"].notna()
+    )
+
+    any_label = (
+        has_cve
+        |
+        has_cwe
+    )
+
+    both = (
+        has_cve
+        &
+        has_cwe
+    )
+
+    return {
+        "cve":
+            int(
+                has_cve.sum()
+            ),
+
+        "cwe":
+            int(
+                has_cwe.sum()
+            ),
+
+        "any":
+            int(
+                any_label.sum()
+            ),
+
+        "both":
+            int(
+                both.sum()
+            ),
+
+        "missing_both":
+            int(
+                (~any_label).sum()
+            ),
+    }
+
+
+def print_stats(
+    title,
+    df,
+):
+
+    stats = label_stats(
+        df
+    )
+
+    total = len(df)
+
+    print(
+        "\n"
+        + "=" * 78
+    )
+
+    print(title)
+
+    print(
+        "=" * 78
+    )
+
+    print(
+        f"CVE:                 "
+        f"{stats['cve']:,}"
+    )
+
+    print(
+        f"CWE:                 "
+        f"{stats['cwe']:,}"
+    )
+
+    print(
+        f"CVE + CWE:           "
+        f"{stats['both']:,}"
+    )
+
+    print(
+        f">=1 label:           "
+        f"{stats['any']:,}"
+        f"/{total:,} "
+        f"("
+        f"{stats['any']/total*100:.2f}%"
+        f")"
+    )
+
+    print(
+        f"Missing both:        "
+        f"{stats['missing_both']:,}"
+        f"/{total:,} "
+        f"("
+        f"{stats['missing_both']/total*100:.2f}%"
+        f")"
+    )
+
+
+def stage_diff(
+    before,
+    after,
+):
+
+    before_cve = (
+        before["cve_id"].notna()
+    )
+
+    before_cwe = (
+        before["cwe_id"].notna()
+    )
+
+    after_cve = (
+        after["cve_id"].notna()
+    )
+
+    after_cwe = (
+        after["cwe_id"].notna()
+    )
+
+    before_any = (
+        before_cve
+        |
+        before_cwe
+    )
+
+    after_any = (
+        after_cve
+        |
+        after_cwe
+    )
+
+    before_both = (
+        before_cve
+        &
+        before_cwe
+    )
+
+    after_both = (
+        after_cve
+        &
+        after_cwe
+    )
+
+    return {
+        "new_cve":
+            int(
+                (
+                    ~before_cve
+                    &
+                    after_cve
+                ).sum()
+            ),
+
+        "new_cwe":
+            int(
+                (
+                    ~before_cwe
+                    &
+                    after_cwe
+                ).sum()
+            ),
+
+        "rescued":
+            int(
+                (
+                    ~before_any
+                    &
+                    after_any
+                ).sum()
+            ),
+
+        "new_complete":
+            int(
+                (
+                    ~before_both
+                    &
+                    after_both
+                ).sum()
+            ),
+    }
+
+
+def print_stage_diff(
+    title,
+    before,
+    after,
+):
+
+    diff = stage_diff(
+        before,
+        after,
+    )
+
+    print(
+        "\n"
+        + "-" * 78
+    )
+
+    print(title)
+
+    print(
+        "-" * 78
+    )
+
+    print(
+        f"CVE mới:                 "
+        f"{diff['new_cve']:,}"
+    )
+
+    print(
+        f"CWE mới:                 "
+        f"{diff['new_cwe']:,}"
+    )
+
+    print(
+        f"Missing-both được cứu:    "
+        f"{diff['rescued']:,}"
+    )
+
+    print(
+        f"Mới đủ CVE + CWE:         "
+        f"{diff['new_complete']:,}"
+    )
+
+
+def save_intermediate(
+    df,
+    filename,
+):
+
+    if not SAVE_INTERMEDIATE:
+        return
+
+    df.to_parquet(
+        filename,
+        index=False,
+    )
+
+    print(
+        f"Saved intermediate: "
+        f"{filename}"
+    )
+
+
+# ============================================================
+# COMMIT SHA
+# ============================================================
+
+def extract_commit_sha(
+    commit_link,
+):
+
+    if not isinstance(
+        commit_link,
+        str,
+    ):
+        return None
+
+    text = (
+        commit_link.strip()
+    )
+
+    if not text:
+        return None
+
+    match = (
+        COMMIT_SHA_RE.search(
+            text
+        )
+    )
+
+    if match:
+
+        return (
+            match.group(1)
+            .lower()
+        )
+
+    # --------------------------------------------------------
+    # git.kernel.org/...commit/?id=SHA
+    # --------------------------------------------------------
+
+    lower = text.lower()
+
+    if (
+        "commit" not in lower
+        and
+        "changeset" not in lower
+    ):
+        return None
+
+    matches = (
+        SHA40_RE.findall(
+            text
+        )
+    )
+
+    if len(matches) != 1:
+        return None
+
+    return (
+        matches[0]
+        .lower()
+    )
+
+
+# ============================================================
+# METHOD 1
+# SAME COMMIT
+# ============================================================
+
+def build_same_commit_map(
+    original_df,
+    label_col,
+):
+
+    values_by_commit = (
+        defaultdict(list)
+    )
+
+    for _, row in (
+        original_df.iterrows()
+    ):
+
+        commit = row.get(
+            "commit_link"
+        )
+
+        value = row.get(
+            label_col
+        )
+
+        if not isinstance(
+            commit,
+            str,
+        ):
+            continue
+
+        commit = (
+            commit.strip()
+        )
+
+        if not commit:
+            continue
+
+        if is_missing(value):
+            continue
+
+        value = (
+            str(value)
+            .strip()
+        )
+
+        values_by_commit[
+            commit
+        ].append(
+            value
+        )
+
+    mapping = {}
+
+    conflicts = 0
+
+    for commit, values in (
+        values_by_commit.items()
+    ):
+
+        unique_values = list(
+            dict.fromkeys(
+                values
+            )
+        )
+
+        if len(unique_values) > 1:
+            conflicts += 1
+
+        # ====================================================
+        # UNAMBIGUOUS
+        # ====================================================
+
+        if COMMIT_MODE == "unambiguous":
+
+            if len(unique_values) == 1:
+
+                mapping[
+                    commit
+                ] = unique_values[0]
+
+        # ====================================================
+        # MAJORITY
+        # ====================================================
+
+        elif COMMIT_MODE == "majority":
+
+            counts = Counter(
+                values
+            )
+
+            winner = (
+                counts
+                .most_common(1)[0][0]
+            )
+
+            mapping[
+                commit
+            ] = winner
+
+        else:
+
+            raise ValueError(
+                "COMMIT_MODE must be "
+                "'majority' or "
+                "'unambiguous'"
+            )
+
+    return (
+        mapping,
+        conflicts,
+    )
+
+
+def apply_same_commit(
+    df,
+    original_df,
+):
+
+    before = (
+        df.copy()
+    )
+
+    print(
+        "\n"
+        + "=" * 78
+    )
+
+    print(
+        "METHOD 1 - SAME COMMIT"
+    )
+
+    print(
+        "=" * 78
+    )
+
+    (
+        cve_map,
+        cve_conflicts,
+    ) = build_same_commit_map(
+        original_df,
+        "cve_id",
+    )
+
+    (
+        cwe_map,
+        cwe_conflicts,
+    ) = build_same_commit_map(
+        original_df,
+        "cwe_id",
+    )
+
+    print(
+        f"commit -> CVE map: "
+        f"{len(cve_map):,}"
+    )
+
+    print(
+        f"commit -> CWE map: "
+        f"{len(cwe_map):,}"
+    )
+
+    print(
+        f"Commit >1 CVE:    "
+        f"{cve_conflicts:,}"
+    )
+
+    print(
+        f"Commit >1 CWE:    "
+        f"{cwe_conflicts:,}"
+    )
+
+    for idx in df.index:
+
+        commit = df.at[
+            idx,
+            "commit_link"
+        ]
+
+        if not isinstance(
+            commit,
+            str,
+        ):
+            continue
+
+        commit = (
+            commit.strip()
+        )
+
+        # CVE
+        if (
+            is_missing(
+                df.at[
+                    idx,
+                    "cve_id"
+                ]
+            )
+            and
+            commit in cve_map
+        ):
+
+            df.at[
+                idx,
+                "cve_id"
+            ] = cve_map[
+                commit
+            ]
+
+            df.at[
+                idx,
+                "cve_source"
+            ] = "same_commit"
+
+        # CWE
+        if (
+            is_missing(
+                df.at[
+                    idx,
+                    "cwe_id"
+                ]
+            )
+            and
+            commit in cwe_map
+        ):
+
+            df.at[
+                idx,
+                "cwe_id"
+            ] = cwe_map[
+                commit
+            ]
+
+            df.at[
+                idx,
+                "cwe_source"
+            ] = "same_commit"
+
+    print_stage_diff(
+        "METHOD 1 RESULT",
+        before,
+        df,
+    )
+
+    return df
+
+
+# ============================================================
+# METHOD 2
+# EXPLICIT LABEL IN COMMIT MESSAGE
+# ============================================================
+
+def extract_message_cves(
+    text,
+):
+
+    if not isinstance(
+        text,
+        str,
+    ):
+        return []
+
+    values = set()
+
+    for year, number in (
+        CVE_MESSAGE_RE.findall(
+            text
+        )
+    ):
+
+        values.add(
+            (
+                f"CVE-{year}-{number}"
+            ).upper()
+        )
+
+    return sorted(
+        values
+    )
+
+
+def extract_message_cwes(
+    text,
+):
+
+    if not isinstance(
+        text,
+        str,
+    ):
+        return []
+
+    values = set()
+
+    for number in (
+        CWE_MESSAGE_RE.findall(
+            text
+        )
+    ):
+
+        values.add(
+            (
+                f"CWE-{number}"
+            ).upper()
+        )
+
+    return sorted(
+        values
+    )
+
+
+def apply_commit_message(
+    df,
+):
+
+    before = (
+        df.copy()
+    )
+
+    print(
+        "\n"
+        + "=" * 78
+    )
+
+    print(
+        "METHOD 2 - EXPLICIT COMMIT MESSAGE"
+    )
+
+    print(
+        "=" * 78
+    )
+
+    rows_with_cve = 0
+    rows_with_cwe = 0
+
+    multi_cve = 0
+    multi_cwe = 0
+
+    for idx in df.index:
+
+        message = df.at[
+            idx,
+            "commit_message"
+        ]
+
+        cves = (
+            extract_message_cves(
+                message
+            )
+        )
+
+        cwes = (
+            extract_message_cwes(
+                message
+            )
+        )
+
+        if cves:
+            rows_with_cve += 1
+
+        if cwes:
+            rows_with_cwe += 1
+
+        if len(cves) > 1:
+            multi_cve += 1
+
+        if len(cwes) > 1:
+            multi_cwe += 1
+
+        # ====================================================
+        # CVE
+        # ====================================================
+
+        if (
+            is_missing(
+                df.at[
+                    idx,
+                    "cve_id"
+                ]
+            )
+            and
+            len(cves) == 1
+        ):
+
+            df.at[
+                idx,
+                "cve_id"
+            ] = cves[0]
+
+            df.at[
+                idx,
+                "cve_source"
+            ] = (
+                "commit_message_explicit"
+            )
+
+        # ====================================================
+        # CWE
+        # ====================================================
+
+        if (
+            is_missing(
+                df.at[
+                    idx,
+                    "cwe_id"
+                ]
+            )
+            and
+            len(cwes) == 1
+        ):
+
+            df.at[
+                idx,
+                "cwe_id"
+            ] = cwes[0]
+
+            df.at[
+                idx,
+                "cwe_source"
+            ] = (
+                "commit_message_explicit"
+            )
+
+    print(
+        f"Message >=1 CVE: "
+        f"{rows_with_cve:,}"
+    )
+
+    print(
+        f"Message >1 CVE:  "
+        f"{multi_cve:,}"
+    )
+
+    print(
+        f"Message >=1 CWE: "
+        f"{rows_with_cwe:,}"
+    )
+
+    print(
+        f"Message >1 CWE:  "
+        f"{multi_cwe:,}"
+    )
+
+    print_stage_diff(
+        "METHOD 2 RESULT",
+        before,
+        df,
+    )
+
+    return df
+
+
+# ============================================================
+# DOWNLOAD
+# ============================================================
+
+def download_file(
+    url,
+    destination,
+):
+
+    destination = Path(
+        destination
+    )
+
+    if destination.exists():
+
+        size_mb = (
+            destination.stat().st_size
+            /
+            1024
+            /
+            1024
+        )
+
+        print(
+            f"Cached: "
+            f"{destination} "
+            f"({size_mb:.1f} MB)"
+        )
+
+        return
+
+    destination.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    temp = Path(
+        str(destination)
+        +
+        ".part"
+    )
+
+    headers = {
+        "User-Agent":
+            "TitanVul-Metadata-Recovery/1.0"
+    }
+
+    print(
+        f"Downloading:\n"
+        f"{url}"
+    )
+
+    with requests.get(
+        url,
+        stream=True,
+        headers=headers,
+        timeout=REQUEST_TIMEOUT,
+    ) as response:
+
+        response.raise_for_status()
+
+        total = int(
+            response.headers.get(
+                "content-length",
+                0,
+            )
+        )
+
+        downloaded = 0
+
+        with open(
+            temp,
+            "wb",
+        ) as f:
+
+            for chunk in (
+                response.iter_content(
+                    chunk_size=
+                        DOWNLOAD_CHUNK_SIZE
+                )
+            ):
+
+                if not chunk:
+                    continue
+
+                f.write(
+                    chunk
+                )
+
+                downloaded += len(
+                    chunk
+                )
+
+                if total:
+
+                    pct = (
+                        downloaded
+                        /
+                        total
+                        *
+                        100
+                    )
+
+                    print(
+                        f"\r"
+                        f"{downloaded/1024/1024:.1f}"
+                        f"/"
+                        f"{total/1024/1024:.1f}"
+                        f" MB "
+                        f"({pct:.1f}%)",
+                        end="",
+                        flush=True,
+                    )
+
+                else:
+
+                    print(
+                        f"\r"
+                        f"{downloaded/1024/1024:.1f}"
+                        f" MB",
+                        end="",
+                        flush=True,
+                    )
+
+    print()
+
+    temp.replace(
+        destination
+    )
+
+
+# ============================================================
+# CACHE HELPERS
+# ============================================================
+
+def save_json(
+    path,
+    data,
+):
+
+    path = Path(
+        path
+    )
+
+    temp = Path(
+        str(path)
+        +
+        ".tmp"
+    )
+
+    with open(
+        temp,
+        "w",
+        encoding="utf-8",
+    ) as f:
+
+        json.dump(
+            data,
+            f,
+            ensure_ascii=False,
+        )
+
+    temp.replace(
+        path
+    )
+
+
+def load_json(
+    path,
+):
+
+    path = Path(
+        path
+    )
+
+    if not path.exists():
+        return None
+
+    try:
+
+        with open(
+            path,
+            "r",
+            encoding="utf-8",
+        ) as f:
+
+            return json.load(
+                f
+            )
+
+    except Exception as e:
+
+        print(
+            f"Warning cache read failed "
+            f"{path}: {e}"
+        )
+
+        return None
+
+
+def save_json_gz(
+    path,
+    data,
+):
+
+    path = Path(
+        path
+    )
+
+    temp = Path(
+        str(path)
+        +
+        ".tmp"
+    )
+
+    with gzip.open(
+        temp,
+        "wt",
+        encoding="utf-8",
+    ) as f:
+
+        json.dump(
+            data,
+            f,
+            ensure_ascii=False,
+        )
+
+    temp.replace(
+        path
+    )
+
+
+def load_json_gz(
+    path,
+):
+
+    path = Path(
+        path
+    )
+
+    if not path.exists():
+        return None
+
+    try:
+
+        with gzip.open(
+            path,
+            "rt",
+            encoding="utf-8",
+        ) as f:
+
+            return json.load(
+                f
+            )
+
+    except Exception as e:
+
+        print(
+            f"Warning cache read failed "
+            f"{path}: {e}"
+        )
+
+        return None
+
+
+# ============================================================
+# METHOD 3
+# OSV events.fixed == SHA
+# ============================================================
+
+def extract_osv_cves(
+    record,
+):
+
+    values = []
+
+    osv_id = record.get(
+        "id"
+    )
+
+    if isinstance(
+        osv_id,
+        str,
+    ):
+
+        values.append(
+            osv_id
+        )
+
+    aliases = record.get(
+        "aliases",
+        []
+    )
+
+    if isinstance(
+        aliases,
+        list,
+    ):
+
+        values.extend(
+            aliases
+        )
+
+    result = []
+
+    for value in values:
+
+        if not isinstance(
+            value,
+            str,
+        ):
+            continue
+
+        value = (
+            value.strip()
+            .upper()
+        )
+
+        if not CVE_FULL_RE.fullmatch(
+            value
+        ):
+            continue
+
+        if value not in result:
+
+            result.append(
+                value
+            )
+
+    return sorted(
+        result
+    )
+
+
+def scan_osv_fixed(
+    target_shas,
+):
+
+    target_shas = set(
+        target_shas
+    )
+
+    # ========================================================
+    # CACHE
+    # ========================================================
+
+    cached = load_json(
+        OSV_FIXED_CACHE
+    )
+
+    if isinstance(
+        cached,
+        dict,
+    ):
+
+        cached_targets = set(
+            cached.get(
+                "_target_shas",
+                []
+            )
+        )
+
+        if (
+            cached_targets
+            ==
+            target_shas
+        ):
+
+            print(
+                "Using OSV fixed cache."
+            )
+
+            return cached.get(
+                "matches",
+                {}
+            )
+
+    # ========================================================
+    # DATABASE
+    # ========================================================
+
+    download_file(
+        OSV_DATABASE_URL,
+        OSV_ZIP,
+    )
+
+    matches = defaultdict(
+        list
+    )
+
+    scanned = 0
+    withdrawn = 0
+    invalid = 0
+    git_ranges = 0
+    fixed_events = 0
+
+    print(
+        "\n"
+        + "=" * 78
+    )
+
+    print(
+        "SCAN OSV events.fixed"
+    )
+
+    print(
+        "=" * 78
+    )
+
+    with zipfile.ZipFile(
+        OSV_ZIP,
+        "r",
+    ) as archive:
+
+        names = [
+            name
+            for name
+            in archive.namelist()
+            if name.endswith(
+                ".json"
+            )
+        ]
+
+        total = len(
+            names
+        )
+
+        print(
+            f"OSV JSON records: "
+            f"{total:,}"
+        )
+
+        for name in names:
+
+            scanned += 1
+
+            try:
+
+                with archive.open(
+                    name
+                ) as f:
+
+                    record = (
+                        json_load_bytes(
+                            f.read()
+                        )
+                    )
+
+            except Exception:
+                invalid += 1
+                continue
+
+            if not isinstance(
+                record,
+                dict,
+            ):
+                invalid += 1
+                continue
+
+            if record.get(
+                "withdrawn"
+            ):
+
+                withdrawn += 1
+                continue
+
+            cves = (
+                extract_osv_cves(
+                    record
+                )
+            )
+
+            if not cves:
+                continue
+
+            affected_list = (
+                record.get(
+                    "affected",
+                    []
+                )
+            )
+
+            if not isinstance(
+                affected_list,
+                list,
+            ):
+                continue
+
+            for affected in affected_list:
+
+                if not isinstance(
+                    affected,
+                    dict,
+                ):
+                    continue
+
+                ranges = affected.get(
+                    "ranges",
+                    []
+                )
+
+                if not isinstance(
+                    ranges,
+                    list,
+                ):
+                    continue
+
+                for range_obj in ranges:
+
+                    if not isinstance(
+                        range_obj,
+                        dict,
+                    ):
+                        continue
+
+                    if (
+                        str(
+                            range_obj.get(
+                                "type",
+                                ""
+                            )
+                        ).upper()
+                        !=
+                        "GIT"
+                    ):
+                        continue
+
+                    git_ranges += 1
+
+                    repo = range_obj.get(
+                        "repo"
+                    )
+
+                    events = range_obj.get(
+                        "events",
+                        []
+                    )
+
+                    if not isinstance(
+                        events,
+                        list,
+                    ):
+                        continue
+
+                    for event in events:
+
+                        if not isinstance(
+                            event,
+                            dict,
+                        ):
+                            continue
+
+                        fixed = event.get(
+                            "fixed"
+                        )
+
+                        if not isinstance(
+                            fixed,
+                            str,
+                        ):
+                            continue
+
+                        fixed = (
+                            fixed.strip()
+                            .lower()
+                        )
+
+                        if not re.fullmatch(
+                            r"[0-9a-f]{40}",
+                            fixed,
+                        ):
+                            continue
+
+                        fixed_events += 1
+
+                        if (
+                            fixed
+                            not in target_shas
+                        ):
+                            continue
+
+                        evidence = {
+                            "osv_id":
+                                record.get(
+                                    "id"
+                                ),
+
+                            "cves":
+                                cves,
+
+                            "repo":
+                                repo,
+                        }
+
+                        if (
+                            evidence
+                            not in
+                            matches[
+                                fixed
+                            ]
+                        ):
+
+                            matches[
+                                fixed
+                            ].append(
+                                evidence
+                            )
+
+            if (
+                scanned % 10000
+                ==
+                0
+            ):
+
+                print(
+                    f"\rOSV "
+                    f"{scanned:,}"
+                    f"/{total:,}"
+                    f" | matched SHA "
+                    f"{len(matches):,}",
+                    end="",
+                    flush=True,
+                )
+
+    print()
+
+    print(
+        f"Scanned:          "
+        f"{scanned:,}"
+    )
+
+    print(
+        f"Withdrawn:        "
+        f"{withdrawn:,}"
+    )
+
+    print(
+        f"Invalid:          "
+        f"{invalid:,}"
+    )
+
+    print(
+        f"GIT ranges:       "
+        f"{git_ranges:,}"
+    )
+
+    print(
+        f"Fixed events:     "
+        f"{fixed_events:,}"
+    )
+
+    print(
+        f"Matched SHA:      "
+        f"{len(matches):,}"
+    )
+
+    output = {
+        "_target_shas":
+            sorted(
+                target_shas
+            ),
+
+        "matches":
+            dict(
+                matches
+            ),
+    }
+
+    save_json(
+        OSV_FIXED_CACHE,
+        output,
+    )
+
+    return dict(
+        matches
+    )
+
+
+def apply_osv(
+    df,
+):
+
+    before = (
+        df.copy()
+    )
+
+    print(
+        "\n"
+        + "=" * 78
+    )
+
+    print(
+        "METHOD 3 - OSV EXACT FIXED COMMIT"
+    )
+
+    print(
+        "=" * 78
+    )
+
+    df[
+        "commit_sha"
+    ] = (
+        df[
+            "commit_link"
+        ]
+        .apply(
+            extract_commit_sha
+        )
+    )
+
+    target_shas = sorted({
+        sha
+        for sha
+        in df.loc[
+            df[
+                "cve_id"
+            ].isna(),
+            "commit_sha"
+        ].dropna()
+    })
+
+    print(
+        f"Target unique SHA: "
+        f"{len(target_shas):,}"
+    )
+
+    matches = (
+        scan_osv_fixed(
+            target_shas
+        )
+    )
+
+    df[
+        "osv_cve_candidates"
+    ] = ""
+
+    df[
+        "osv_status"
+    ] = None
+
+    for idx in df.index[
+        df[
+            "cve_id"
+        ].isna()
+    ]:
+
+        sha = df.at[
+            idx,
+            "commit_sha"
+        ]
+
+        if not sha:
+            continue
+
+        evidence = (
+            matches.get(
+                sha,
+                []
+            )
+        )
+
+        if not evidence:
+
+            df.at[
+                idx,
+                "osv_status"
+            ] = (
+                "no_exact_fixed_match"
+            )
+
+            continue
+
+        cves = sorted({
+            cve
+            for item in evidence
+            for cve in item.get(
+                "cves",
+                []
+            )
+        })
+
+        df.at[
+            idx,
+            "osv_cve_candidates"
+        ] = ";".join(
+            cves
+        )
+
+        if len(cves) == 1:
+
+            df.at[
+                idx,
+                "cve_id"
+            ] = cves[0]
+
+            df.at[
+                idx,
+                "cve_source"
+            ] = (
+                "osv_fixed_commit_exact"
+            )
+
+            df.at[
+                idx,
+                "osv_status"
+            ] = (
+                "single_cve_filled"
+            )
+
+        elif len(cves) > 1:
+
+            df.at[
+                idx,
+                "osv_status"
+            ] = (
+                "multiple_cves_ambiguous"
+            )
+
+    print_stage_diff(
+        "METHOD 3 RESULT",
+        before,
+        df,
+    )
+
+    return df
+
+
+# ============================================================
+# METHOD 4
+# NVD
+# ============================================================
+
+def ensure_nvd_feeds():
+
+    NVD_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    files = []
+
+    for year in range(
+        NVD_START_YEAR,
+        NVD_END_YEAR + 1,
+    ):
+
+        filename = (
+            f"nvdcve-2.0-"
+            f"{year}.json.gz"
+        )
+
+        path = (
+            NVD_DIR
+            /
+            filename
+        )
+
+        url = (
+            f"{NVD_FEED_BASE}/"
+            f"{filename}"
+        )
+
+        download_file(
+            url,
+            path,
+        )
+
+        files.append(
+            path
+        )
+
+    return files
+
+
+def extract_nvd_cwes(
+    cve_record,
+):
+
+    result = []
+
+    weaknesses = (
+        cve_record.get(
+            "weaknesses",
+            []
+        )
+    )
+
+    if not isinstance(
+        weaknesses,
+        list,
+    ):
+        return []
+
+    for weakness in weaknesses:
+
+        if not isinstance(
+            weakness,
+            dict,
+        ):
+            continue
+
+        descriptions = (
+            weakness.get(
+                "description",
+                []
+            )
+        )
+
+        if not isinstance(
+            descriptions,
+            list,
+        ):
+            continue
+
+        for description in descriptions:
+
+            if not isinstance(
+                description,
+                dict,
+            ):
+                continue
+
+            value = description.get(
+                "value"
+            )
+
+            if not isinstance(
+                value,
+                str,
+            ):
+                continue
+
+            value = (
+                value.strip()
+                .upper()
+            )
+
+            if (
+                CWE_FULL_RE.fullmatch(
+                    value
+                )
+                and
+                value not in result
+            ):
+
+                result.append(
+                    value
+                )
+
+    return sorted(
+        result
+    )
+
+
+def nvd_patch_ref(
+    reference,
+):
+
+    tags = reference.get(
+        "tags",
+        []
+    )
+
+    if not isinstance(
+        tags,
+        list,
+    ):
+        return False
+
+    return any(
+        str(tag)
+        .strip()
+        .lower()
+        ==
+        "patch"
+        for tag in tags
+    )
+
+
+def scan_nvd(
+    target_shas,
+):
+
+    target_shas = set(
+        target_shas
+    )
+
+    # ========================================================
+    # CACHE
+    # ========================================================
+
+    cached = load_json_gz(
+        NVD_SCAN_CACHE
+    )
+
+    if isinstance(
+        cached,
+        dict,
+    ):
+
+        cached_targets = set(
+            cached.get(
+                "_target_shas",
+                []
+            )
+        )
+
+        if (
+            cached_targets
+            ==
+            target_shas
+        ):
+
+            print(
+                "Using NVD scan cache."
+            )
+
+            return cached
+
+    # ========================================================
+    # FEEDS
+    # ========================================================
+
+    files = (
+        ensure_nvd_feeds()
+    )
+
+    patch_matches = (
+        defaultdict(list)
+    )
+
+    nonpatch_matches = (
+        defaultdict(list)
+    )
+
+    cve_to_cwes = {}
+
+    records = 0
+    references = 0
+    patch_refs = 0
+
+    print(
+        "\n"
+        + "=" * 78
+    )
+
+    print(
+        "SCAN NVD"
+    )
+
+    print(
+        "=" * 78
+    )
+
+    for path in files:
+
+        print(
+            f"Reading: "
+            f"{path.name}"
+        )
+
+        try:
+
+            with gzip.open(
+                path,
+                "rt",
+                encoding="utf-8",
+            ) as f:
+
+                data = json.load(
+                    f
+                )
+
+        except Exception as e:
+
+            print(
+                f"ERROR reading "
+                f"{path}: {e}"
+            )
+
+            continue
+
+        vulnerabilities = (
+            data.get(
+                "vulnerabilities",
+                []
+            )
+        )
+
+        if not isinstance(
+            vulnerabilities,
+            list,
+        ):
+            continue
+
+        for item in vulnerabilities:
+
+            records += 1
+
+            if not isinstance(
+                item,
+                dict,
+            ):
+                continue
+
+            cve = item.get(
+                "cve",
+                {}
+            )
+
+            if not isinstance(
+                cve,
+                dict,
+            ):
+                continue
+
+            cve_id = cve.get(
+                "id"
+            )
+
+            if not isinstance(
+                cve_id,
+                str,
+            ):
+                continue
+
+            cve_id = (
+                cve_id.strip()
+                .upper()
+            )
+
+            if not CVE_FULL_RE.fullmatch(
+                cve_id
+            ):
+                continue
+
+            # =================================================
+            # CVE -> CWE
+            # =================================================
+
+            cwes = (
+                extract_nvd_cwes(
+                    cve
+                )
+            )
+
+            cve_to_cwes[
+                cve_id
+            ] = cwes
+
+            # =================================================
+            # REFERENCES
+            # =================================================
+
+            refs = cve.get(
+                "references",
+                []
+            )
+
+            if not isinstance(
+                refs,
+                list,
+            ):
+                continue
+
+            for ref in refs:
+
+                if not isinstance(
+                    ref,
+                    dict,
+                ):
+                    continue
+
+                references += 1
+
+                url = ref.get(
+                    "url"
+                )
+
+                if not isinstance(
+                    url,
+                    str,
+                ):
+                    continue
+
+                is_patch = (
+                    nvd_patch_ref(
+                        ref
+                    )
+                )
+
+                if is_patch:
+                    patch_refs += 1
+
+                found_shas = (
+                    SHA40_RE.findall(
+                        url
+                    )
+                )
+
+                for sha in found_shas:
+
+                    sha = (
+                        sha.lower()
+                    )
+
+                    if (
+                        sha
+                        not in target_shas
+                    ):
+                        continue
+
+                    evidence = {
+                        "cve":
+                            cve_id,
+
+                        "cwes":
+                            cwes,
+
+                        "url":
+                            url,
+
+                        "tags":
+                            ref.get(
+                                "tags",
+                                []
+                            ),
+                    }
+
+                    destination = (
+                        patch_matches
+                        if is_patch
+                        else
+                        nonpatch_matches
+                    )
+
+                    if (
+                        evidence
+                        not in
+                        destination[
+                            sha
+                        ]
+                    ):
+
+                        destination[
+                            sha
+                        ].append(
+                            evidence
+                        )
+
+    print(
+        "\n"
+        + "=" * 78
+    )
+
+    print(
+        "NVD SCAN SUMMARY"
+    )
+
+    print(
+        "=" * 78
+    )
+
+    print(
+        f"NVD records scanned:      "
+        f"{records:,}"
+    )
+
+    print(
+        f"References inspected:     "
+        f"{references:,}"
+    )
+
+    print(
+        f"References tagged Patch:  "
+        f"{patch_refs:,}"
+    )
+
+    print(
+        f"Target SHA w/ Patch ref:  "
+        f"{len(patch_matches):,}"
+    )
+
+    print(
+        f"Target SHA non-Patch:     "
+        f"{len(nonpatch_matches):,}"
+    )
+
+    result = {
+        "_target_shas":
+            sorted(
+                target_shas
+            ),
+
+        "patch_matches":
+            dict(
+                patch_matches
+            ),
+
+        "nonpatch_matches":
+            dict(
+                nonpatch_matches
+            ),
+
+        "cve_to_cwes":
+            cve_to_cwes,
+    }
+
+    save_json_gz(
+        NVD_SCAN_CACHE,
+        result,
+    )
+
+    return result
+
+
+def apply_nvd(
+    df,
+):
+
+    before = (
+        df.copy()
+    )
+
+    print(
+        "\n"
+        + "=" * 78
+    )
+
+    print(
+        "METHOD 4 - NVD EXACT PATCH COMMIT"
+    )
+
+    print(
+        "=" * 78
+    )
+
+    target_shas = sorted({
+        sha
+        for sha
+        in df.loc[
+            df[
+                "cve_id"
+            ].isna(),
+            "commit_sha"
+        ].dropna()
+    })
+
+    print(
+        f"Target SHA: "
+        f"{len(target_shas):,}"
+    )
+
+    scan = scan_nvd(
+        target_shas
+    )
+
+    patch_matches = (
+        scan[
+            "patch_matches"
+        ]
+    )
+
+    nonpatch_matches = (
+        scan[
+            "nonpatch_matches"
+        ]
+    )
+
+    cve_to_cwes = (
+        scan[
+            "cve_to_cwes"
+        ]
+    )
+
+    df[
+        "nvd_cve_candidates"
+    ] = ""
+
+    df[
+        "nvd_cwe_candidates"
+    ] = ""
+
+    df[
+        "nvd_patch_urls"
+    ] = ""
+
+    df[
+        "nvd_status"
+    ] = None
+
+    # ========================================================
+    # SHA -> CVE
+    # ========================================================
+
+    for idx in df.index[
+        df[
+            "cve_id"
+        ].isna()
+    ]:
+
+        sha = df.at[
+            idx,
+            "commit_sha"
+        ]
+
+        if not sha:
+            continue
+
+        evidence = (
+            patch_matches.get(
+                sha,
+                []
+            )
+        )
+
+        if not evidence:
+
+            broad = (
+                nonpatch_matches.get(
+                    sha,
+                    []
+                )
+            )
+
+            if broad:
+
+                cves = sorted({
+                    item.get(
+                        "cve"
+                    )
+                    for item in broad
+                    if item.get(
+                        "cve"
+                    )
+                })
+
+                df.at[
+                    idx,
+                    "nvd_cve_candidates"
+                ] = ";".join(
+                    cves
+                )
+
+                df.at[
+                    idx,
+                    "nvd_status"
+                ] = (
+                    "exact_sha_nonpatch_only"
+                )
+
+            continue
+
+        cves = sorted({
+            item.get(
+                "cve"
+            )
+            for item in evidence
+            if item.get(
+                "cve"
+            )
+        })
+
+        cwes = sorted({
+            cwe
+            for item in evidence
+            for cwe in item.get(
+                "cwes",
+                []
+            )
+        })
+
+        urls = sorted({
+            item.get(
+                "url"
+            )
+            for item in evidence
+            if item.get(
+                "url"
+            )
+        })
+
+        df.at[
+            idx,
+            "nvd_cve_candidates"
+        ] = ";".join(
+            cves
+        )
+
+        df.at[
+            idx,
+            "nvd_cwe_candidates"
+        ] = ";".join(
+            cwes
+        )
+
+        df.at[
+            idx,
+            "nvd_patch_urls"
+        ] = ";".join(
+            urls
+        )
+
+        # ====================================================
+        # EXACTLY 1 CVE
+        # ====================================================
+
+        if len(cves) == 1:
+
+            df.at[
+                idx,
+                "cve_id"
+            ] = cves[0]
+
+            df.at[
+                idx,
+                "cve_source"
+            ] = (
+                "nvd_patch_commit_exact"
+            )
+
+            df.at[
+                idx,
+                "nvd_status"
+            ] = (
+                "single_cve_filled"
+            )
+
+            # -----------------------------------------------
+            # CWE from same Patch evidence
+            # -----------------------------------------------
+
+            if (
+                is_missing(
+                    df.at[
+                        idx,
+                        "cwe_id"
+                    ]
+                )
+                and
+                len(cwes) == 1
+            ):
+
+                df.at[
+                    idx,
+                    "cwe_id"
+                ] = cwes[0]
+
+                df.at[
+                    idx,
+                    "cwe_source"
+                ] = (
+                    "nvd_patch_commit_exact"
+                )
+
+        elif len(cves) > 1:
+
+            df.at[
+                idx,
+                "nvd_status"
+            ] = (
+                "multiple_cves_ambiguous"
+            )
+
+    # ========================================================
+    # CVE -> CWE
+    # ========================================================
+
+    indices = df.index[
+        df[
+            "cwe_id"
+        ].isna()
+        &
+        df[
+            "cve_id"
+        ].notna()
+    ]
+
+    for idx in indices:
+
+        cve = (
+            str(
+                df.at[
+                    idx,
+                    "cve_id"
+                ]
+            )
+            .strip()
+            .upper()
+        )
+
+        cwes = (
+            cve_to_cwes.get(
+                cve,
+                []
+            )
+        )
+
+        # Only exactly one CWE
+        if len(cwes) == 1:
+
+            df.at[
+                idx,
+                "cwe_id"
+            ] = cwes[0]
+
+            df.at[
+                idx,
+                "cwe_source"
+            ] = (
+                "nvd_cve_exact"
+            )
+
+    print_stage_diff(
+        "METHOD 4 RESULT",
+        before,
+        df,
+    )
+
+    return df
+
+
+# ============================================================
+# METHOD 5
+# CVE.ORG / CVELISTV5
+# ============================================================
+
+def cveorg_patch_ref(
+    reference,
+):
+
+    tags = reference.get(
+        "tags",
+        []
+    )
+
+    if not isinstance(
+        tags,
+        list,
+    ):
+        return False
+
+    for tag in tags:
+
+        tag = (
+            str(tag)
+            .strip()
+            .lower()
+            .replace(
+                "_",
+                "-"
+            )
+        )
+
+        if tag == "patch":
+            return True
+
+        if tag.endswith(
+            "-patch"
+        ):
+            return True
+
+    return False
+
+
+def looks_like_commit_url(
+    url,
+    sha,
+):
+
+    if not isinstance(
+        url,
+        str,
+    ):
+        return False
+
+    lower = (
+        url.lower()
+    )
+
+    sha = (
+        sha.lower()
+    )
+
+    if sha not in lower:
+        return False
+
+    patterns = [
+        "/commit/",
+        "/commits/",
+        "/-/commit/",
+        "/commitdiff/",
+        "/commitdiff_plain/",
+        "/changeset/",
+    ]
+
+    if any(
+        pattern in lower
+        for pattern in patterns
+    ):
+
+        return True
+
+    # --------------------------------------------------------
+    # kernel.org / cgit
+    # --------------------------------------------------------
+
+    if "commit" in lower:
+
+        try:
+
+            parsed = (
+                urlparse(
+                    url
+                )
+            )
+
+            query = (
+                parse_qs(
+                    parsed.query
+                )
+            )
+
+            for key in [
+                "id",
+                "h",
+                "hash",
+                "commit",
+            ]:
+
+                values = query.get(
+                    key,
+                    []
+                )
+
+                for value in values:
+
+                    if (
+                        str(value)
+                        .lower()
+                        ==
+                        sha
+                    ):
+
+                        return True
+
+        except Exception:
+            pass
+
+        # exact SHA + "commit" in URL
+        return True
+
+    return False
+
+
+def extract_cveorg_cwes(
+    container,
+):
+
+    result = []
+
+    if not isinstance(
+        container,
+        dict,
+    ):
+        return result
+
+    problem_types = (
+        container.get(
+            "problemTypes",
+            []
+        )
+    )
+
+    if not isinstance(
+        problem_types,
+        list,
+    ):
+        return result
+
+    for problem in problem_types:
+
+        if not isinstance(
+            problem,
+            dict,
+        ):
+            continue
+
+        descriptions = (
+            problem.get(
+                "descriptions",
+                []
+            )
+        )
+
+        if not isinstance(
+            descriptions,
+            list,
+        ):
+            continue
+
+        for description in descriptions:
+
+            if not isinstance(
+                description,
+                dict,
+            ):
+                continue
+
+            candidates = []
+
+            cwe_id = description.get(
+                "cweId"
+            )
+
+            if isinstance(
+                cwe_id,
+                str,
+            ):
+
+                candidates.append(
+                    cwe_id
+                )
+
+            text = description.get(
+                "description"
+            )
+
+            if isinstance(
+                text,
+                str,
+            ):
+
+                candidates.extend(
+                    re.findall(
+                        r"\bCWE-\d+\b",
+                        text,
+                        re.IGNORECASE,
+                    )
+                )
+
+            for candidate in candidates:
+
+                candidate = (
+                    candidate
+                    .strip()
+                    .upper()
+                )
+
+                if (
+                    CWE_FULL_RE.fullmatch(
+                        candidate
+                    )
+                    and
+                    candidate not in result
+                ):
+
+                    result.append(
+                        candidate
+                    )
+
+    return sorted(
+        result
+    )
+
+
+def cveorg_containers(
+    record,
+):
+
+    result = []
+
+    if not isinstance(
+        record,
+        dict,
+    ):
+        return result
+
+    containers = record.get(
+        "containers",
+        {}
+    )
+
+    if not isinstance(
+        containers,
+        dict,
+    ):
+        return result
+
+    # ========================================================
+    # CNA
+    # ========================================================
+
+    cna = containers.get(
+        "cna"
+    )
+
+    if isinstance(
+        cna,
+        dict,
+    ):
+
+        result.append(
+            (
+                "cna",
+                cna,
+            )
+        )
+
+    # ========================================================
+    # ADP
+    # ========================================================
+
+    adps = containers.get(
+        "adp",
+        []
+    )
+
+    if isinstance(
+        adps,
+        list,
+    ):
+
+        for i, adp in enumerate(
+            adps
+        ):
+
+            if isinstance(
+                adp,
+                dict,
+            ):
+
+                result.append(
+                    (
+                        f"adp[{i}]",
+                        adp,
+                    )
+                )
+
+    return result
+
+
+def scan_cveorg(
+    target_shas,
+):
+
+    target_shas = set(
+        target_shas
+    )
+
+    # ========================================================
+    # CACHE
+    # ========================================================
+
+    cached = load_json_gz(
+        CVEORG_SCAN_CACHE
+    )
+
+    if isinstance(
+        cached,
+        dict,
+    ):
+
+        cached_targets = set(
+            cached.get(
+                "_target_shas",
+                []
+            )
+        )
+
+        if (
+            cached_targets
+            ==
+            target_shas
+        ):
+
+            print(
+                "Using CVE.org scan cache."
+            )
+
+            return cached
+
+    # ========================================================
+    # DOWNLOAD / CACHE ZIP
+    # ========================================================
+
+    download_file(
+        CVELIST_URL,
+        CVELIST_ZIP,
+    )
+
+    patch_matches = (
+        defaultdict(list)
+    )
+
+    nonpatch_matches = (
+        defaultdict(list)
+    )
+
+    cve_to_cwes = {}
+
+    # ========================================================
+    # COUNTERS
+    # ========================================================
+
+    records = 0
+
+    valid_records = 0
+
+    rejected_records = 0
+
+    invalid_json = 0
+
+    invalid_shape = 0
+
+    missing_metadata = 0
+
+    references = 0
+
+    patch_refs = 0
+
+    exact_patch_evidences = 0
+
+    exact_nonpatch_evidences = 0
+
+    print(
+        "\n"
+        + "=" * 78
+    )
+
+    print(
+        "SCAN CVE.ORG / CVELISTV5"
+    )
+
+    print(
+        "=" * 78
+    )
+
+    with zipfile.ZipFile(
+        CVELIST_ZIP,
+        "r",
+    ) as archive:
+
+        names = [
+            name
+            for name in archive.namelist()
+            if (
+                name.lower()
+                .endswith(".json")
+                and
+                "/cves/" in (
+                    "/" + name.lower()
+                )
+            )
+        ]
+
+        total = len(
+            names
+        )
+
+        print(
+            f"CVE JSON files: "
+            f"{total:,}"
+        )
+
+        for name in names:
+
+            records += 1
+
+            # =================================================
+            # READ JSON
+            # =================================================
+
+            try:
+
+                with archive.open(
+                    name
+                ) as f:
+
+                    raw = f.read()
+
+                record = (
+                    json_load_bytes(
+                        raw
+                    )
+                )
+
+            except Exception as e:
+
+                invalid_json += 1
+
+                if invalid_json <= 10:
+
+                    print(
+                        "\nInvalid JSON skipped:"
+                    )
+
+                    print(
+                        f"  {name}"
+                    )
+
+                    print(
+                        f"  {e}"
+                    )
+
+                continue
+
+            # =================================================
+            # IMPORTANT FIX
+            #
+            # Some JSON files have root = list.
+            #
+            # NEVER call .get() before checking dict.
+            # =================================================
+
+            if not isinstance(
+                record,
+                dict,
+            ):
+
+                invalid_shape += 1
+
+                if invalid_shape <= 10:
+
+                    print(
+                        "\nNon-record JSON skipped:"
+                    )
+
+                    print(
+                        f"  File: "
+                        f"{name}"
+                    )
+
+                    print(
+                        f"  Root type: "
+                        f"{type(record).__name__}"
+                    )
+
+                    if isinstance(
+                        record,
+                        list,
+                    ):
+
+                        print(
+                            f"  List length: "
+                            f"{len(record):,}"
+                        )
+
+                continue
+
+            # =================================================
+            # METADATA
+            # =================================================
+
+            metadata = record.get(
+                "cveMetadata",
+                {}
+            )
+
+            if not isinstance(
+                metadata,
+                dict,
+            ):
+
+                invalid_shape += 1
+                continue
+
+            state = str(
+                metadata.get(
+                    "state",
+                    ""
+                )
+            ).upper()
+
+            if state == "REJECTED":
+
+                rejected_records += 1
+                continue
+
+            cve_id = metadata.get(
+                "cveId"
+            )
+
+            if not isinstance(
+                cve_id,
+                str,
+            ):
+
+                missing_metadata += 1
+                continue
+
+            cve_id = (
+                cve_id
+                .strip()
+                .upper()
+            )
+
+            if not CVE_FULL_RE.fullmatch(
+                cve_id
+            ):
+
+                missing_metadata += 1
+                continue
+
+            valid_records += 1
+
+            # =================================================
+            # CNA + ADP
+            # =================================================
+
+            containers = (
+                cveorg_containers(
+                    record
+                )
+            )
+
+            # =================================================
+            # CVE -> CWE
+            # =================================================
+
+            all_cwes = []
+
+            for (
+                container_name,
+                container,
+            ) in containers:
+
+                if not isinstance(
+                    container,
+                    dict,
+                ):
+                    continue
+
+                try:
+
+                    found_cwes = (
+                        extract_cveorg_cwes(
+                            container
+                        )
+                    )
+
+                except Exception:
+                    found_cwes = []
+
+                for cwe in found_cwes:
+
+                    if (
+                        cwe
+                        not in all_cwes
+                    ):
+
+                        all_cwes.append(
+                            cwe
+                        )
+
+            cve_to_cwes[
+                cve_id
+            ] = sorted(
+                all_cwes
+            )
+
+            # =================================================
+            # REFERENCES
+            # =================================================
+
+            for (
+                container_name,
+                container,
+            ) in containers:
+
+                if not isinstance(
+                    container,
+                    dict,
+                ):
+                    continue
+
+                refs = container.get(
+                    "references",
+                    []
+                )
+
+                if not isinstance(
+                    refs,
+                    list,
+                ):
+                    continue
+
+                for ref in refs:
+
+                    if not isinstance(
+                        ref,
+                        dict,
+                    ):
+                        continue
+
+                    references += 1
+
+                    url = ref.get(
+                        "url"
+                    )
+
+                    if not isinstance(
+                        url,
+                        str,
+                    ):
+                        continue
+
+                    url = (
+                        url.strip()
+                    )
+
+                    if not url:
+                        continue
+
+                    is_patch = (
+                        cveorg_patch_ref(
+                            ref
+                        )
+                    )
+
+                    if is_patch:
+                        patch_refs += 1
+
+                    found_shas = (
+                        SHA40_RE.findall(
+                            url
+                        )
+                    )
+
+                    if not found_shas:
+                        continue
+
+                    for sha in found_shas:
+
+                        sha = (
+                            sha.lower()
+                        )
+
+                        # -------------------------------------
+                        # only target TitanVul SHA
+                        # -------------------------------------
+
+                        if (
+                            sha
+                            not in target_shas
+                        ):
+                            continue
+
+                        # -------------------------------------
+                        # exact commit-like URL only
+                        # -------------------------------------
+
+                        if not looks_like_commit_url(
+                            url,
+                            sha,
+                        ):
+
+                            continue
+
+                        evidence = {
+                            "cve":
+                                cve_id,
+
+                            "cwes":
+                                sorted(
+                                    all_cwes
+                                ),
+
+                            "url":
+                                url,
+
+                            "tags":
+                                ref.get(
+                                    "tags",
+                                    []
+                                ),
+
+                            "name":
+                                ref.get(
+                                    "name"
+                                ),
+
+                            "container":
+                                container_name,
+                        }
+
+                        # =====================================
+                        # PATCH
+                        # =====================================
+
+                        if is_patch:
+
+                            if (
+                                evidence
+                                not in
+                                patch_matches[
+                                    sha
+                                ]
+                            ):
+
+                                patch_matches[
+                                    sha
+                                ].append(
+                                    evidence
+                                )
+
+                                exact_patch_evidences += 1
+
+                        # =====================================
+                        # NON-PATCH
+                        # =====================================
+
+                        else:
+
+                            if (
+                                evidence
+                                not in
+                                nonpatch_matches[
+                                    sha
+                                ]
+                            ):
+
+                                nonpatch_matches[
+                                    sha
+                                ].append(
+                                    evidence
+                                )
+
+                                exact_nonpatch_evidences += 1
+
+            # =================================================
+            # PROGRESS
+            # =================================================
+
+            if (
+                records
+                %
+                10000
+                ==
+                0
+            ):
+
+                print(
+                    f"\rCVE.org "
+                    f"{records:,}"
+                    f"/{total:,}"
+                    f" | patch SHA "
+                    f"{len(patch_matches):,}"
+                    f" | nonpatch SHA "
+                    f"{len(nonpatch_matches):,}",
+                    end="",
+                    flush=True,
+                )
+
+    print()
+
+    # ========================================================
+    # SUMMARY
+    # ========================================================
+
+    print(
+        "\n"
+        + "=" * 78
+    )
+
+    print(
+        "CVE.ORG SCAN SUMMARY"
+    )
+
+    print(
+        "=" * 78
+    )
+
+    print(
+        f"Files scanned:             "
+        f"{records:,}"
+    )
+
+    print(
+        f"Valid CVE records:         "
+        f"{valid_records:,}"
+    )
+
+    print(
+        f"Rejected CVEs:             "
+        f"{rejected_records:,}"
+    )
+
+    print(
+        f"Invalid JSON:              "
+        f"{invalid_json:,}"
+    )
+
+    print(
+        f"Non-record JSON:           "
+        f"{invalid_shape:,}"
+    )
+
+    print(
+        f"Missing/bad metadata:      "
+        f"{missing_metadata:,}"
+    )
+
+    print(
+        f"References inspected:      "
+        f"{references:,}"
+    )
+
+    print(
+        f"References tagged patch:   "
+        f"{patch_refs:,}"
+    )
+
+    print(
+        f"Target SHA w/ patch ref:   "
+        f"{len(patch_matches):,}"
+    )
+
+    print(
+        f"Target SHA w/ nonpatch:    "
+        f"{len(nonpatch_matches):,}"
+    )
+
+    print(
+        f"Exact patch evidences:     "
+        f"{exact_patch_evidences:,}"
+    )
+
+    print(
+        f"Exact nonpatch evidences:  "
+        f"{exact_nonpatch_evidences:,}"
+    )
+
+    print(
+        f"CVE -> CWE mappings:       "
+        f"{len(cve_to_cwes):,}"
+    )
+
+    # ========================================================
+    # CACHE
+    # ========================================================
+
+    result = {
+        "_target_shas":
+            sorted(
+                target_shas
+            ),
+
+        "patch_matches":
+            dict(
+                patch_matches
+            ),
+
+        "nonpatch_matches":
+            dict(
+                nonpatch_matches
+            ),
+
+        "cve_to_cwes":
+            cve_to_cwes,
+
+        "_stats": {
+            "records":
+                records,
+
+            "valid_records":
+                valid_records,
+
+            "rejected_records":
+                rejected_records,
+
+            "invalid_json":
+                invalid_json,
+
+            "invalid_shape":
+                invalid_shape,
+
+            "missing_metadata":
+                missing_metadata,
+
+            "references":
+                references,
+
+            "patch_refs":
+                patch_refs,
+
+            "exact_patch_evidences":
+                exact_patch_evidences,
+
+            "exact_nonpatch_evidences":
+                exact_nonpatch_evidences,
+        },
+    }
+
+    save_json_gz(
+        CVEORG_SCAN_CACHE,
+        result,
+    )
+
+    return result
+
+
+def apply_cveorg(
+    df,
+):
+
+    before = (
+        df.copy()
+    )
+
+    print(
+        "\n"
+        + "=" * 78
+    )
+
+    print(
+        "METHOD 5 - CVE.ORG EXACT PATCH COMMIT"
+    )
+
+    print(
+        "=" * 78
+    )
+
+    target_shas = sorted({
+        sha
+        for sha
+        in df.loc[
+            df[
+                "cve_id"
+            ].isna(),
+            "commit_sha"
+        ].dropna()
+    })
+
+    print(
+        f"Target SHA: "
+        f"{len(target_shas):,}"
+    )
+
+    scan = scan_cveorg(
+        target_shas
+    )
+
+    patch_matches = (
+        scan[
+            "patch_matches"
+        ]
+    )
+
+    nonpatch_matches = (
+        scan[
+            "nonpatch_matches"
+        ]
+    )
+
+    cve_to_cwes = (
+        scan[
+            "cve_to_cwes"
+        ]
+    )
+
+    # ========================================================
+    # AUDIT COLUMNS
+    # ========================================================
+
+    df[
+        "cveorg_cve_candidates"
+    ] = ""
+
+    df[
+        "cveorg_cwe_candidates"
+    ] = ""
+
+    df[
+        "cveorg_patch_urls"
+    ] = ""
+
+    df[
+        "cveorg_status"
+    ] = None
+
+    # ========================================================
+    # EXACT PATCH COMMIT -> CVE
+    # ========================================================
+
+    for idx in df.index[
+        df[
+            "cve_id"
+        ].isna()
+    ]:
+
+        sha = df.at[
+            idx,
+            "commit_sha"
+        ]
+
+        if not sha:
+            continue
+
+        strong = (
+            patch_matches.get(
+                sha,
+                []
+            )
+        )
+
+        broad = (
+            nonpatch_matches.get(
+                sha,
+                []
+            )
+        )
+
+        # ====================================================
+        # NO PATCH EVIDENCE
+        # ====================================================
+
+        if not strong:
+
+            if broad:
+
+                cves = sorted({
+                    item.get(
+                        "cve"
+                    )
+                    for item in broad
+                    if item.get(
+                        "cve"
+                    )
+                })
+
+                df.at[
+                    idx,
+                    "cveorg_cve_candidates"
+                ] = ";".join(
+                    cves
+                )
+
+                df.at[
+                    idx,
+                    "cveorg_status"
+                ] = (
+                    "exact_commit_nonpatch_only"
+                )
+
+            else:
+
+                df.at[
+                    idx,
+                    "cveorg_status"
+                ] = (
+                    "no_exact_commit_reference"
+                )
+
+            continue
+
+        # ====================================================
+        # PATCH EVIDENCE
+        # ====================================================
+
+        cves = sorted({
+            item.get(
+                "cve"
+            )
+            for item in strong
+            if item.get(
+                "cve"
+            )
+        })
+
+        cwes = sorted({
+            cwe
+            for item in strong
+            for cwe in item.get(
+                "cwes",
+                []
+            )
+        })
+
+        urls = sorted({
+            item.get(
+                "url"
+            )
+            for item in strong
+            if item.get(
+                "url"
+            )
+        })
+
+        df.at[
+            idx,
+            "cveorg_cve_candidates"
+        ] = ";".join(
+            cves
+        )
+
+        df.at[
+            idx,
+            "cveorg_cwe_candidates"
+        ] = ";".join(
+            cwes
+        )
+
+        df.at[
+            idx,
+            "cveorg_patch_urls"
+        ] = ";".join(
+            urls
+        )
+
+        if len(cves) == 1:
+
+            df.at[
+                idx,
+                "cve_id"
+            ] = cves[0]
+
+            df.at[
+                idx,
+                "cve_source"
+            ] = (
+                "cveorg_patch_commit_exact"
+            )
+
+            df.at[
+                idx,
+                "cveorg_status"
+            ] = (
+                "single_cve_filled"
+            )
+
+            if (
+                is_missing(
+                    df.at[
+                        idx,
+                        "cwe_id"
+                    ]
+                )
+                and
+                len(cwes) == 1
+            ):
+
+                df.at[
+                    idx,
+                    "cwe_id"
+                ] = cwes[0]
+
+                df.at[
+                    idx,
+                    "cwe_source"
+                ] = (
+                    "cveorg_patch_commit_exact"
+                )
+
+        elif len(cves) > 1:
+
+            df.at[
+                idx,
+                "cveorg_status"
+            ] = (
+                "multiple_cves_ambiguous"
+            )
+
+    # ========================================================
+    # CVE -> CWE VIA CVE.ORG
+    # ========================================================
+
+    indices = df.index[
+        df[
+            "cwe_id"
+        ].isna()
+        &
+        df[
+            "cve_id"
+        ].notna()
+    ]
+
+    for idx in indices:
+
+        cve = (
+            str(
+                df.at[
+                    idx,
+                    "cve_id"
+                ]
+            )
+            .strip()
+            .upper()
+        )
+
+        cwes = (
+            cve_to_cwes.get(
+                cve,
+                []
+            )
+        )
+
+        # Only exactly one CWE
+        if len(cwes) == 1:
+
+            df.at[
+                idx,
+                "cwe_id"
+            ] = cwes[0]
+
+            df.at[
+                idx,
+                "cwe_source"
+            ] = (
+                "cveorg_cve_exact"
+            )
+
+    print_stage_diff(
+        "METHOD 5 RESULT",
+        before,
+        df,
+    )
+
+    return df
+
+
+# ============================================================
+# FINAL SAVE
+# ============================================================
+
+def save_final(
+    df,
+):
+
+    df[
+        "has_cve"
+    ] = (
+        df[
+            "cve_id"
+        ].notna()
+    )
+
+    df[
+        "has_cwe"
+    ] = (
+        df[
+            "cwe_id"
+        ].notna()
+    )
+
+    df[
+        "has_vuln_label"
+    ] = (
+        df[
+            "has_cve"
+        ]
+        |
+        df[
+            "has_cwe"
+        ]
+    )
+
+    df[
+        "has_both_cve_cwe"
+    ] = (
+        df[
+            "has_cve"
+        ]
+        &
+        df[
+            "has_cwe"
+        ]
+    )
+
+    # ========================================================
+    # FULL FILE
+    # ========================================================
+
+    df.to_parquet(
+        FINAL_PARQUET,
+        index=False,
+    )
+
+    df.to_csv(
+        FINAL_CSV,
+        index=False,
+    )
+
+    # ========================================================
+    # AUDIT FILE
+    # ========================================================
+
+    audit_cols = [
+        "file_name",
+        "extension",
+        "language",
+
+        "commit_link",
+        "commit_sha",
+        "commit_message",
+
+        "cve_id",
+        "cve_source",
+
+        "cwe_id",
+        "cwe_source",
+
+        "osv_cve_candidates",
+        "osv_status",
+
+        "nvd_cve_candidates",
+        "nvd_cwe_candidates",
+        "nvd_patch_urls",
+        "nvd_status",
+
+        "cveorg_cve_candidates",
+        "cveorg_cwe_candidates",
+        "cveorg_patch_urls",
+        "cveorg_status",
+
+        "has_cve",
+        "has_cwe",
+        "has_vuln_label",
+        "has_both_cve_cwe",
+    ]
+
+    audit_cols = [
+        col
+        for col in audit_cols
+        if col in df.columns
+    ]
+
+    df[
+        audit_cols
+    ].to_csv(
+        FINAL_AUDIT,
+        index=True,
+    )
+
+    # ========================================================
+    # MISSING BOTH
+    # ========================================================
+
+    missing = df[
+        ~df[
+            "has_vuln_label"
+        ]
+    ]
+
+    missing.to_csv(
+        "TitanVul_still_missing_both.csv",
+        index=True,
+    )
+
+    # ========================================================
+    # CVE.ORG NONPATCH REVIEW
+    # ========================================================
+
+    if (
+        "cveorg_status"
+        in df.columns
+    ):
+
+        nonpatch = df[
+            df[
+                "cveorg_status"
+            ]
+            ==
+            "exact_commit_nonpatch_only"
+        ]
+
+        nonpatch.to_csv(
+            "TitanVul_cveorg_nonpatch_review.csv",
+            index=True,
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print(
+        "=" * 78
+    )
+
+    print(
+        "TITANVUL - COMPLETE METADATA RECOVERY PIPELINE"
+    )
+
+    print(
+        "=" * 78
+    )
+
+    print(
+        f"Input:            "
+        f"{INPUT_PARQUET}"
+    )
+
+    print(
+        f"Commit mode:      "
+        f"{COMMIT_MODE}"
+    )
+
+    print(
+        f"Fast JSON/orjson: "
+        f"{FAST_JSON}"
+    )
+
+    # ========================================================
+    # LOAD ORIGINAL
+    # ========================================================
+
+    df = pd.read_parquet(
+        INPUT_PARQUET
+    )
+
+    df = normalize_missing(
+        df
+    )
+
+    df = initialize_sources(
+        df
+    )
+
+    original_df = (
+        df.copy()
+    )
+
+    original_stats = (
+        label_stats(
+            original_df
+        )
+    )
+
+    print_stats(
+        "ORIGINAL TITANVUL",
+        df,
+    )
+
+    # ========================================================
+    # METHOD 1
+    # ========================================================
+
+    df = apply_same_commit(
+        df,
+        original_df,
+    )
+
+    # ========================================================
+    # METHOD 2
+    # ========================================================
+
+    df = apply_commit_message(
+        df
+    )
+
+    print_stats(
+        "AFTER METHOD 1 + 2",
+        df,
+    )
+
+    save_intermediate(
+        df,
+        "TitanVul_recovery_2methods.parquet",
+    )
+
+    # ========================================================
+    # METHOD 3
+    # ========================================================
+
+    df = apply_osv(
+        df
+    )
+
+    print_stats(
+        "AFTER METHOD 3 / OSV",
+        df,
+    )
+
+    save_intermediate(
+        df,
+        "TitanVul_recovery_3methods_FIXED.parquet",
+    )
+
+    # ========================================================
+    # METHOD 4
+    # ========================================================
+
+    df = apply_nvd(
+        df
+    )
+
+    print_stats(
+        "AFTER METHOD 4 / NVD",
+        df,
+    )
+
+    save_intermediate(
+        df,
+        "TitanVul_recovery_4methods_NVD.parquet",
+    )
+
+    # ========================================================
+    # METHOD 5
+    # ========================================================
+
+    df = apply_cveorg(
+        df
+    )
+
+    print_stats(
+        "AFTER METHOD 5 / CVE.ORG",
+        df,
+    )
+
+    save_intermediate(
+        df,
+        "TitanVul_recovery_5methods_CVEORG.parquet",
+    )
+
+    # ========================================================
+    # FINAL
+    # ========================================================
+
+    save_final(
+        df
+    )
+
+    final_stats = (
+        label_stats(
+            df
+        )
+    )
+
+    total = len(
+        df
+    )
+
+    recovered = (
+        final_stats[
+            "any"
+        ]
+        -
+        original_stats[
+            "any"
+        ]
+    )
+
+    print(
+        "\n"
+        + "=" * 78
+    )
+
+    print(
+        "FINAL SUMMARY"
+    )
+
+    print(
+        "=" * 78
+    )
+
+    print(
+        f"Total samples:             "
+        f"{total:,}"
+    )
+
+    print(
+        f"Original >=1 label:        "
+        f"{original_stats['any']:,}"
+        f"/{total:,} "
+        f"("
+        f"{original_stats['any']/total*100:.2f}%"
+        f")"
+    )
+
+    print(
+        f"Final >=1 label:           "
+        f"{final_stats['any']:,}"
+        f"/{total:,} "
+        f"("
+        f"{final_stats['any']/total*100:.2f}%"
+        f")"
+    )
+
+    print(
+        f"Recovered new samples:     "
+        f"+{recovered:,}"
+    )
+
+    print(
+        f"\nFinal CVE:                "
+        f"{final_stats['cve']:,}"
+    )
+
+    print(
+        f"Final CWE:                 "
+        f"{final_stats['cwe']:,}"
+    )
+
+    print(
+        f"Final CVE + CWE:           "
+        f"{final_stats['both']:,}"
+        f"/{total:,} "
+        f"("
+        f"{final_stats['both']/total*100:.2f}%"
+        f")"
+    )
+
+    print(
+        f"Still missing both:        "
+        f"{final_stats['missing_both']:,}"
+        f"/{total:,} "
+        f"("
+        f"{final_stats['missing_both']/total*100:.2f}%"
+        f")"
+    )
+
+    # ========================================================
+    # SOURCE DISTRIBUTION
+    # ========================================================
+
+    print(
+        "\n"
+        + "=" * 78
+    )
+
+    print(
+        "CVE SOURCES"
+    )
+
+    print(
+        "=" * 78
+    )
+
+    print(
+        df[
+            "cve_source"
+        ]
+        .value_counts(
+            dropna=False
+        )
+        .to_string()
+    )
+
+    print(
+        "\n"
+        + "=" * 78
+    )
+
+    print(
+        "CWE SOURCES"
+    )
+
+    print(
+        "=" * 78
+    )
+
+    print(
+        df[
+            "cwe_source"
+        ]
+        .value_counts(
+            dropna=False
+        )
+        .to_string()
+    )
+
+    # ========================================================
+    # OUTPUT
+    # ========================================================
+
+    print(
+        "\n"
+        + "=" * 78
+    )
+
+    print(
+        "OUTPUT FILES"
+    )
+
+    print(
+        "=" * 78
+    )
+
+    print(
+        FINAL_PARQUET
+    )
+
+    print(
+        FINAL_CSV
+    )
+
+    print(
+        FINAL_AUDIT
+    )
+
+    print(
+        "TitanVul_still_missing_both.csv"
+    )
+
+    print(
+        "TitanVul_cveorg_nonpatch_review.csv"
+    )
+
+    print(
+        "\n"
+        + "=" * 78
+    )
+
+    print(
+        "DONE"
+    )
+
+    print(
+        "=" * 78
+    )
+
+
+if __name__ == "__main__":
+    main()

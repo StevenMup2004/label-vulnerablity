@@ -1,0 +1,7 @@
+# lõi sinh nhãn dòng
+tree_sitter
+tree_sitter_language_pack
+
+# driver đọc/ghi parquet
+pandas
+pyarrow
